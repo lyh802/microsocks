@@ -1,34 +1,48 @@
-# if you want to change/override some variables, do so in a file called
-# config.mak, which is gets included automatically if it exists.
+#
+# Copyright (C) 2006-2014 OpenWrt.org
+#
+# This is free software, licensed under the GNU General Public License v2.
+# See /LICENSE for more information.
+#
 
-prefix = /usr/local
-bindir = $(prefix)/bin
+include $(TOPDIR)/rules.mk
 
-PROG = microsocks
-SRCS =  sockssrv.c sblist.c sblist_delete.c
-OBJS = $(SRCS:.c=.o)
+PKG_NAME:=microsocks
+PKG_VERSION:=1.0.1
+PKG_RELEASE:=1
 
-LIBS = -lpthread
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)
 
-CFLAGS += -Wall -std=c99
+include $(INCLUDE_DIR)/package.mk
 
--include config.mak
+define Package/microsocks
+  SUBMENU:=Web Servers/Proxies
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=Microsocks is a lightweight Socks proxy
+  MAINTAINER:=lyh802 forked from rofl0r
+  DEPENDS:=+libpthread
+endef
 
-all: $(PROG)
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
+endef
 
-install: $(PROG)
-	install -d $(DESTDIR)/$(bindir)
-	install -D -m 755 $(PROG) $(DESTDIR)/$(bindir)/$(PROG)
+define Build/Configure
+endef
 
-clean:
-	rm -f $(PROG)
-	rm -f $(OBJS)
+define Build/Compile
+	$(MAKE) -C $(PKG_BUILD_DIR) \
+	ARCH="$(LINUX_KARCH)" \
+        CC="$(TARGET_CC)" \
+        CFLAGS="$(TARGET_CFLAGS) -Wall" \
+        LDFLAGS="$(TARGET_LDFLAGS)"
+endef
 
-%.o: %.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INC) $(PIC) -c -o $@ $<
+define Package/microsocks/install
+	$(INSTALL_DIR) $(1)/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/$(PKG_NAME) $(1)/bin/
+endef
 
-$(PROG): $(OBJS)
-	$(CC) $(LDFLAGS) $(OBJS) $(LIBS) -o $@
-
-.PHONY: all clean install
-
+$(eval $(call BuildPackage,microsocks))
