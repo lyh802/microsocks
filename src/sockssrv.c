@@ -37,7 +37,7 @@
 #include <limits.h>
 #include "sblist.h"
 
-#define THREAD_BUFFER_SIZE 1024
+#define THREAD_BUFFER_SIZE 2048
 
 #ifndef MAX
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
