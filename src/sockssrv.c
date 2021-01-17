@@ -134,37 +134,37 @@ static union sockaddr_union bind_addr = { .v4.sin_family = AF_UNSPEC, };
 static void dolog(const char* fmt, ...) { }
 #endif
 
-static int connect_socks_target(struct client* client, unsigned char* in, ssize_t n) {
-	// 至少6字节
-	if (n < 6 || in[0] != 5) { return -EC_GENERAL_FAILURE; }
-	if (in[1] != 1) { return -EC_COMMAND_NOT_SUPPORTED; /* we support only CONNECT method */ }
-	if (in[2] != 0) { return -EC_GENERAL_FAILURE; /* malformed packet */ }
+static int connect_socks_target(struct client* client, uint8_t* buf, size_t n) {
+	// 头部固定4字节
+	if (n < 4 || buf[0] != 5 || buf[2] != 0) { return -EC_GENERAL_FAILURE; /* malformed packet */ }
+	if (buf[1] != 1) { return -EC_COMMAND_NOT_SUPPORTED; /* we support only CONNECT method */ }
 
 	int ret = AF_INET;
-	size_t minlen = 4 + 4 + 2, len;
-	char host[256], port[8];
-	switch (in[3]) {
+	size_t i = 4 + 4;	// 端口
+	char port[6];
+	switch (buf[3]) {
 		case AT_IPV6: /* ipv6 */
 			ret = AF_INET6;
-			minlen = 4 + 16 + 2;
+			i = 4 + 16;
 			/* fall through */
 		case AT_IPV4: /* ipv4 */
-			if (n < minlen) { return -EC_GENERAL_FAILURE; }
-			if (host != inet_ntop(ret, &in[4], host, sizeof(host))) {
+			if (i + 2 > n) { return -EC_GENERAL_FAILURE; }
+			snprintf(port, sizeof(port), "%u", ntohs(*(uint16_t*)&buf[i]));
+			if (!inet_ntop(ret, &buf[4], (char*)&buf[i + 2], INET6_ADDRSTRLEN)) {	// IPV6最大长度为4+16+2+45(+1)
 				return -EC_GENERAL_FAILURE; /* malformed or too long addr */
 			}
+			i = i + 2;	// host
 			break;
 		case AT_DNS: /* dns name */
-			len = in[4];
-			minlen = 4 + 1 + len + 2;
-			if (n < minlen) { return -EC_GENERAL_FAILURE; }
-			memcpy(host, &in[4 + 1], len);
-			host[len] = 0;
+			i = 4 + 1 + buf[4];
+			if (i + 2 > n) { return -EC_GENERAL_FAILURE; }	// DNS最大长度为4+1+255+2
+			snprintf(port, sizeof(port), "%u", ntohs(*(uint16_t*)&buf[i]));
+			buf[i] = 0;	// 原始host结束符
+			i = 4 + 1;	// host
 			break;
 		default:
 			return -EC_ADDRESSTYPE_NOT_SUPPORTED;
 	}
-	snprintf(port, sizeof(port), "%u", (unsigned short)((in[minlen - 2] << 8) | in[minlen - 1]));
 
 	struct addrinfo hints = {
 		.ai_flags = AI_ADDRCONFIG,
@@ -172,18 +172,18 @@ static int connect_socks_target(struct client* client, unsigned char* in, ssize_
 		.ai_socktype = SOCK_STREAM,
 		.ai_protocol = 0,
 	};
-	struct addrinfo* remote = 0;
+	struct addrinfo* addr;
 	/* there's no suitable errorcode in rfc1928 for dns lookup failure */
-	if (getaddrinfo(host, port, &hints, &remote)) {
+	if (getaddrinfo((char*)&buf[i], port, &hints, &addr)) {
 		perror("resolve");
 		return -EC_GENERAL_FAILURE;
 	}
-	if ((ret = socket(remote->ai_family, remote->ai_socktype, 0)) == -1
+	if ((ret = socket(addr->ai_family, addr->ai_socktype, 0)) == -1
 		|| (SOCKADDR_UNION_AF(&bind_addr) != AF_UNSPEC
 		&& bind(ret, (struct sockaddr*)&bind_addr, SOCKADDR_UNION_LENGTH(&bind_addr)))
-		|| connect(ret, remote->ai_addr, remote->ai_addrlen)) {
+		|| connect(ret, addr->ai_addr, addr->ai_addrlen)) {
 		close(ret);
-		freeaddrinfo(remote);
+		freeaddrinfo(addr);
 		switch(errno) {
 			case ETIMEDOUT:
 				return -EC_TTL_EXPIRED;
@@ -204,12 +204,12 @@ static int connect_socks_target(struct client* client, unsigned char* in, ssize_
 				return -EC_GENERAL_FAILURE;
 		}
 	}
-	freeaddrinfo(remote);
+	freeaddrinfo(addr);
 
 	if(CONFIG_LOG) {
 		char name[256];
 		inet_ntop(SOCKADDR_UNION_AF(&client->addr), SOCKADDR_UNION_ADDRESS(&client->addr), name, sizeof(name));
-		dolog("client[%d] %s: connected to %s:%s\n", client->fd, name, host, port);
+		dolog("client[%d] %s: connected to %s:%s\n", client->fd, name, (char*)&buf[i], port);
 	}
 	return ret;
 }
@@ -234,11 +234,11 @@ static void add_auth_ip(union sockaddr_union* addr) {
 	sblist_add(auth_ips, addr);
 }
 
-static enum authmethod check_auth_method(struct client* client, unsigned char* in, ssize_t n) {
-	// 至少3字节
-	if (n < 3 || in[0] != 5) { return AM_INVALID; }
-	for (n = MIN(n, in[1] + 2) - 1; n + 1 > 2; --n) {
-		switch (in[n]) {
+static enum authmethod check_auth_method(struct client* client, uint8_t* buf, size_t n) {
+	// 头部固定2字节
+	if (n < 2 || buf[0] != 5) { return AM_INVALID; }
+	for (n = MIN(n, buf[1] + 2) - 1; n + 1 > 2; --n) {
+		switch (buf[n]) {
 			case AM_NO_AUTH:
 				if (!auth_user) { return AM_NO_AUTH; }
 				else if (auth_ips) {
@@ -260,20 +260,19 @@ static enum authmethod check_auth_method(struct client* client, unsigned char* i
 	return AM_INVALID;
 }
 
-static void send_auth_response(int fd, unsigned char *in, enum errorcode code) {
-	unsigned char buf[2] = { in[0], code, };
+static void send_auth_response(int fd, uint8_t* buf, enum errorcode code) {
+	buf[1] = code;
 	write(fd, buf, 2);
 }
 
-static void send_code(int fd, unsigned char *in, enum errorcode code) {
+static void send_code(int fd, uint8_t* buf, enum errorcode code) {
 	/* position 4 contains ATYP, the address type, which is the same as used in the connect
 	   request. we're lazy and return always IPV4 address type in errors. */
-	unsigned char buf[10] = { in[0], code, 0, 1 /*AT_IPV4*/, 0, 0, 0, 0, 0, 0 };
-	write(fd, buf, 10);
+	buf[1] = code; buf[3] = AT_IPV4; /*AT_IPV4*/
+	write(fd, buf, 4 + 4 + 2);
 }
 
-static void copyloop(int fd1, unsigned char *in, int fd2) {
-	unsigned char buf[4] = { in[0], 0, 0, in[3], };
+static void copyloop(int fd1, uint8_t* buf, int fd2) {
 	struct pollfd fds[2] = {
 		[0] = { .fd = fd1, .events = POLLIN, },
 		[1] = { .fd = fd2, .events = POLLIN, },
@@ -285,6 +284,7 @@ static void copyloop(int fd1, unsigned char *in, int fd2) {
 		   when a connection is really unused. */
 		switch (poll(fds, 2, 15 * 60 * 1000)) {
 			case 0:
+				buf[0] = 5; buf[2] = 0;
 				send_code(fd1, buf, EC_TTL_EXPIRED);
 				return;
 			case -1:
@@ -297,37 +297,35 @@ static void copyloop(int fd1, unsigned char *in, int fd2) {
 		int infd, outfd;
 		if (fds[0].revents & POLLIN) { infd = fd1; outfd = fd2; }
 		else { infd = fd2; outfd = fd1; }
-		ssize_t i, n = read(infd, in, THREAD_BUFFER_SIZE);
+		ssize_t n = read(infd, buf, THREAD_BUFFER_SIZE);
 		if (n <= 0) { return; }
+		size_t i;
 		for (i = 0; i < n;) {
-			ssize_t t = write(outfd, &in[i], n - i);
+			ssize_t t = write(outfd, &buf[i], n - i);
 			if (t < 0) { return; }
 			i += t;
 		}
 	}
 }
 
-static enum errorcode check_credentials(unsigned char* in, size_t n) {
-	// 至少5个字节
-	if (n < 5 || in[0] != 1) { return EC_GENERAL_FAILURE; }
-	unsigned char ulen, plen;
-	if (n < 2 + (ulen = in[1]) + 2
-		|| n < 2 + ulen + 1 + (plen = in[ulen + 2])) { return EC_GENERAL_FAILURE; }
-	char user[256], pass[256];
-	memcpy(user, &in[2], ulen);
-	memcpy(pass, &in[2 + ulen + 1], plen);
-	user[ulen] = 0;
-	pass[plen] = 0;
-	if (strcmp(user, auth_user) || strcmp(pass, auth_pass)) { return EC_NOT_ALLOWED; }
+static enum errorcode check_credentials(uint8_t* buf, size_t n) {
+	// 至少3个字节
+	if (n < 3 || buf[0] != 1) { return EC_GENERAL_FAILURE; }
+	uint8_t ulen, plen;
+	if (n < 2 + (ulen = buf[1]) + 1
+		|| n < 2 + ulen + 1 + (plen = buf[2 + ulen])) { return EC_GENERAL_FAILURE; }	// 最大长度为2+255+1+255(+1)
+	buf[2 + ulen] = 0;	// 原始user结束符
+	buf[2 + ulen + 1 + plen] = 0;	// 原始pass结束符
+	if (strcmp((char *)&buf[2], auth_user) || strcmp((char *)&buf[2 + ulen + 1], auth_pass)) { return EC_NOT_ALLOWED; }
 	return EC_SUCCESS;
 }
 
 static void* clientthread(void* data) {
 	struct thread* t = data;
+	uint8_t buf[THREAD_BUFFER_SIZE];
+	enum socksstate state = SS_1_CONNECTED;
 	int ret;
 	ssize_t n;
-	unsigned char buf[THREAD_BUFFER_SIZE];
-	enum socksstate state = SS_1_CONNECTED;
 	for (; (n = recv(t->client.fd, buf, THREAD_BUFFER_SIZE, 0)) > 0;) {
 		switch (state) {
 			case SS_1_CONNECTED:
@@ -430,7 +428,7 @@ static struct addrinfo* param_resolve(int argc, char* argv[]) {
 		.ai_socktype = SOCK_STREAM,
 		.ai_protocol = 0,
 	};
-	struct addrinfo* addr = 0;
+	struct addrinfo* addr;
 	const char* listen_ip = 0;
 	const char* listen_port = "1080";
 	// 解析参数
@@ -550,4 +548,3 @@ exit:
 	free(threads);
 	return 0;
 }
-
