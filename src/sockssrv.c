@@ -30,13 +30,14 @@
 #include <pthread.h>
 #include <signal.h>
 #include <setjmp.h>
-#include <poll.h>
 #include <netdb.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
 #include "sblist.h"
 
+#define MAX_EVENTS 128
 #define THREAD_BUFFER_SIZE 2048
 
 #ifndef MAX
@@ -62,9 +63,10 @@
 #endif
 
 enum socksstate {
-	SS_1_CONNECTED,
-	SS_2_NEED_AUTH, /* skipped if NO_AUTH method supported */
-	SS_3_AUTHED,
+	SS_1_CONNECTED = -4,
+	SS_2_NEED_AUTH = -3, /* skipped if NO_AUTH method supported */
+	SS_3_AUTHED = -2,
+	SS_CLEANUP = -1,
 };
 
 enum addresstype {
@@ -105,15 +107,17 @@ union sockaddr_union {
 #define SOCKADDR_UNION_ADDRESS(PTR) (struct sockaddr*)(\
 	(SOCKADDR_UNION_AF(PTR) == AF_INET6) ? &(PTR)->v6.sin6_addr : &(PTR)->v4.sin_addr)
 
-struct client {
-	int fd;
-	union sockaddr_union addr;
+struct buffer {
+	size_t count;
+	size_t capacity;
+	uint8_t data[THREAD_BUFFER_SIZE];
 };
 
-struct thread {
+struct client {
+	volatile int state;
+	int fd[2];
+	struct buffer* ptr[2];
 	pthread_t pt;
-	volatile int done;
-	struct client client;
 };
 
 static const char* auth_user = 0;
@@ -134,7 +138,7 @@ static union sockaddr_union bind_addr = { .v4.sin_family = AF_UNSPEC, };
 static void dolog(const char* fmt, ...) { }
 #endif
 
-static int connect_socks_target(struct client* client, uint8_t* buf, size_t n) {
+static int connect_socks_target(union sockaddr_union* client, uint8_t* buf, size_t n) {
 	// 头部固定4字节
 	if (n < 4 || buf[0] != 5 || buf[2] != 0) { return -EC_GENERAL_FAILURE; /* malformed packet */ }
 	if (buf[1] != 1) { return -EC_COMMAND_NOT_SUPPORTED; /* we support only CONNECT method */ }
@@ -178,7 +182,7 @@ static int connect_socks_target(struct client* client, uint8_t* buf, size_t n) {
 		perror("resolve");
 		return -EC_GENERAL_FAILURE;
 	}
-	if ((ret = socket(addr->ai_family, addr->ai_socktype, 0)) == -1
+	if ((ret = socket(addr->ai_family, addr->ai_socktype, 0)) < 0
 		|| (SOCKADDR_UNION_AF(&bind_addr) != AF_UNSPEC
 		&& bind(ret, (struct sockaddr*)&bind_addr, SOCKADDR_UNION_LENGTH(&bind_addr)))
 		|| connect(ret, addr->ai_addr, addr->ai_addrlen)) {
@@ -208,23 +212,23 @@ static int connect_socks_target(struct client* client, uint8_t* buf, size_t n) {
 
 	if(CONFIG_LOG) {
 		char name[256];
-		inet_ntop(SOCKADDR_UNION_AF(&client->addr), SOCKADDR_UNION_ADDRESS(&client->addr), name, sizeof(name));
-		dolog("client[%d] %s: connected to %s:%s\n", client->fd, name, (char*)&buf[i], port);
+		inet_ntop(SOCKADDR_UNION_AF(client), SOCKADDR_UNION_ADDRESS(client), name, sizeof(name));
+		dolog("client %s: connected to %s:%s\n", name, (char*)&buf[i], port);
 	}
 	return ret;
 }
 
-static int is_authed(union sockaddr_union* client, union sockaddr_union* authedip) {
-	if (SOCKADDR_UNION_AF(client) == SOCKADDR_UNION_AF(authedip)
-		&& !memcmp(client, authedip, SOCKADDR_UNION_LENGTH(client))) {
-		return 1;
+static int is_authed(union sockaddr_union* addr, union sockaddr_union* authed) {
+	if (SOCKADDR_UNION_AF(addr) != SOCKADDR_UNION_AF(authed)
+		|| memcmp(addr, authed, SOCKADDR_UNION_LENGTH(authed))) {
+		return 0;
 	}
-	return 0;
+	return 1;
 }
 
 static int is_in_authed_list(union sockaddr_union* addr) {
 	size_t i;
-	for (i = sblist_getsize(auth_ips) - 1; i + 1 > 0; --i) {
+	for (i = sblist_getsize(auth_ips); i-- > 0;) {
 		if (is_authed(addr, sblist_get(auth_ips, i))) { return 1; }
 	}
 	return 0;
@@ -234,17 +238,17 @@ static void add_auth_ip(union sockaddr_union* addr) {
 	sblist_add(auth_ips, addr);
 }
 
-static enum authmethod check_auth_method(struct client* client, uint8_t* buf, size_t n) {
+static enum authmethod check_auth_method(union sockaddr_union* addr, uint8_t* buf, size_t n) {
 	// 头部固定2字节
 	if (n < 2 || buf[0] != 5) { return AM_INVALID; }
-	for (n = MIN(n, buf[1] + 2) - 1; n + 1 > 2; --n) {
+	for (n = MIN(n, buf[1] + 2); n-- > 2;) {
 		switch (buf[n]) {
 			case AM_NO_AUTH:
 				if (!auth_user) { return AM_NO_AUTH; }
 				else if (auth_ips) {
 					int authed = 0;
 					if (!pthread_rwlock_rdlock(&auth_ips_lock)) {
-						authed = is_in_authed_list(&client->addr);
+						authed = is_in_authed_list(addr);
 						pthread_rwlock_unlock(&auth_ips_lock);
 					}
 					if (authed) { return AM_NO_AUTH; }
@@ -260,54 +264,6 @@ static enum authmethod check_auth_method(struct client* client, uint8_t* buf, si
 	return AM_INVALID;
 }
 
-static void send_auth_response(int fd, uint8_t* buf, enum errorcode code) {
-	buf[1] = code;
-	write(fd, buf, 2);
-}
-
-static void send_code(int fd, uint8_t* buf, enum errorcode code) {
-	/* position 4 contains ATYP, the address type, which is the same as used in the connect
-	   request. we're lazy and return always IPV4 address type in errors. */
-	buf[1] = code; buf[3] = AT_IPV4; /*AT_IPV4*/
-	write(fd, buf, 4 + 4 + 2);
-}
-
-static void copyloop(int fd1, uint8_t* buf, int fd2) {
-	struct pollfd fds[2] = {
-		[0] = { .fd = fd1, .events = POLLIN, },
-		[1] = { .fd = fd2, .events = POLLIN, },
-	};
-
-	for (;;) {
-		/* inactive connections are reaped after 15 min to free resources.
-		   usually programs send keep-alive packets so this should only happen
-		   when a connection is really unused. */
-		switch (poll(fds, 2, 15 * 60 * 1000)) {
-			case 0:
-				buf[0] = 5; buf[2] = 0;
-				send_code(fd1, buf, EC_TTL_EXPIRED);
-				return;
-			case -1:
-				if (errno == EINTR || errno == EAGAIN) { continue; }
-				perror("poll");
-				return;
-			default:
-				break;
-		}
-		int infd, outfd;
-		if (fds[0].revents & POLLIN) { infd = fd1; outfd = fd2; }
-		else { infd = fd2; outfd = fd1; }
-		ssize_t n = read(infd, buf, THREAD_BUFFER_SIZE);
-		if (n <= 0) { return; }
-		size_t i;
-		for (i = 0; i < n;) {
-			ssize_t t = write(outfd, &buf[i], n - i);
-			if (t < 0) { return; }
-			i += t;
-		}
-	}
-}
-
 static enum errorcode check_credentials(uint8_t* buf, size_t n) {
 	// 至少3个字节
 	if (n < 3 || buf[0] != 1) { return EC_GENERAL_FAILURE; }
@@ -316,45 +272,75 @@ static enum errorcode check_credentials(uint8_t* buf, size_t n) {
 		|| n < 2 + ulen + 1 + (plen = buf[2 + ulen])) { return EC_GENERAL_FAILURE; }	// 最大长度为2+255+1+255(+1)
 	buf[2 + ulen] = 0;	// 原始user结束符
 	buf[2 + ulen + 1 + plen] = 0;	// 原始pass结束符
-	if (strcmp((char *)&buf[2], auth_user) || strcmp((char *)&buf[2 + ulen + 1], auth_pass)) { return EC_NOT_ALLOWED; }
+	if (strcmp((char*)&buf[2], auth_user) || strcmp((char*)&buf[2 + ulen + 1], auth_pass)) { return EC_NOT_ALLOWED; }
 	return EC_SUCCESS;
 }
 
+static void send_auth_response(int fd, uint8_t* buf, enum errorcode code) {
+	buf[1] = code;
+	send(fd, buf, 2, 0);
+}
+
+static void send_code(int fd, uint8_t* buf, enum errorcode code) {
+	/* position 4 contains ATYP, the address type, which is the same as used in the connect
+	   request. we're lazy and return always IPV4 address type in errors. */
+	buf[1] = code; buf[3] = AT_IPV4; /*AT_IPV4*/
+	send(fd, buf, 4 + 4 + 2, 0);
+}
+
 static void* clientthread(void* data) {
-	struct thread* t = data;
-	uint8_t buf[THREAD_BUFFER_SIZE];
-	enum socksstate state = SS_1_CONNECTED;
-	int ret;
-	ssize_t n;
-	for (; (n = recv(t->client.fd, buf, THREAD_BUFFER_SIZE, 0)) > 0;) {
-		switch (state) {
+	struct client* client = data;
+	union sockaddr_union addr;
+	int ret = sizeof(addr), fd = client->fd[0];
+	if (getpeername(fd, (struct sockaddr*)&addr, (socklen_t*)&ret)) { goto breakloop; }
+
+	uint8_t buf[4+1+255+2];
+	for (; (ret = recv(fd, buf, sizeof(buf), 0)) > 0;) {
+		switch (client->state) {
 			case SS_1_CONNECTED:
-				ret = check_auth_method(&t->client, buf, n);
-				send_auth_response(t->client.fd, buf, ret);
-				if (ret == AM_USERNAME) { state = SS_2_NEED_AUTH; }
-				else if (ret == AM_NO_AUTH) { state = SS_3_AUTHED; }
+				ret = check_auth_method(&addr, buf, ret);
+				send_auth_response(fd, buf, ret);
+				if (ret == AM_USERNAME) { client->state = SS_2_NEED_AUTH; }
+				else if (ret == AM_NO_AUTH) { client->state = SS_3_AUTHED; }
 				else { goto breakloop; }
 				break;
 			case SS_2_NEED_AUTH:
-				ret = check_credentials(buf, n);
-				send_auth_response(t->client.fd, buf, ret);
+				ret = check_credentials(buf, ret);
+				send_auth_response(fd, buf, ret);
 				if (ret == EC_SUCCESS) {
-					state = SS_3_AUTHED;
+					client->state = SS_3_AUTHED;
 					if (auth_ips && !pthread_rwlock_wrlock(&auth_ips_lock)) {
-						if (!is_in_authed_list(&t->client.addr)) { add_auth_ip(&t->client.addr); }
+						if (!is_in_authed_list(&addr)) { add_auth_ip(&addr); }
 						pthread_rwlock_unlock(&auth_ips_lock);
 					}
 				}
 				else { goto breakloop; }
 				break;
 			case SS_3_AUTHED:
-				ret = connect_socks_target(&t->client, buf, n);
+				ret = connect_socks_target(&addr, buf, ret);
 				if (ret < 0) {
-					send_code(t->client.fd, buf, -ret);
+					perror("connect_socks_target");
+					send_code(fd, buf, -ret);
 				}
 				else {
-					send_code(t->client.fd, buf, EC_SUCCESS);
-					copyloop(t->client.fd, buf, ret);
+					send_code(fd, buf, EC_SUCCESS);
+
+					int epoll_fd = client->fd[1];
+					client->fd[1] = ret;
+					client->ptr[0] = 0;
+					client->ptr[1] = 0;
+					struct epoll_event ev = {
+						.events = EPOLLIN | EPOLLOUT | EPOLLET,
+						.data.ptr = (unsigned long)client | 0,
+					};
+					if (!epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev)) {
+						ev.data.ptr = (unsigned long)client | 1;
+						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ret, &ev)) {
+							perror("epoll_ctl: add1");
+						}
+						return 0;
+                    }
+					perror("epoll_ctl: add0");
 					close(ret);
 				}
 				/* fall through */
@@ -363,19 +349,80 @@ static void* clientthread(void* data) {
 		}
 	}
 breakloop:
-	close(t->client.fd);
-	t->done = 1;
-	return 0;
+	close(fd);
+	client->state = SS_CLEANUP;
+	return -1;
 }
 
-static void collect(sblist *threads) {
+static void copyloop(struct client* client, uint8_t idx, size_t j) {
+	uint8_t buf[THREAD_BUFFER_SIZE];
 	size_t i;
-	for (i = sblist_getsize(threads) - 1; i + 1 > 0; --i) {
-		struct thread* thread = *((struct thread**)sblist_get(threads, i));
-		if (thread->done) {
+	ssize_t n, t;
+	if (client->ptr[idx]) {
+		// 仍有数据待发送
+		i = client->ptr[idx]->count;
+		n = client->ptr[idx]->capacity;
+		for (; i < n && (t = send(client->fd[!idx], &buf[i], n - i, MSG_DONTWAIT)) > 0; i += t) {}
+		if (i < n) {
+			client->ptr[idx]->count = i;
+		} else {
+			free(client->ptr[idx]);
+			client->ptr[idx] = 0;
+		}
+	}
+	if (!client->ptr[idx]) {
+		for (; (n = recv(client->fd[idx], buf, sizeof(buf), MSG_DONTWAIT)) > 0;) {
+			for (i = 0; i < n && (t = send(client->fd[!idx], &buf[i], n - i, MSG_DONTWAIT)) > 0; i += t) {}
+			if (i < n) { break; }
+		}
+	}
+	if (n > 0) {
+		// 数据未发完
+		if (client->ptr[idx] = malloc(sizeof(struct buffer))) {
+			client->ptr[idx]->count = 0;
+			client->ptr[idx]->capacity = n - i;
+			memcpy(client->ptr[idx]->data, &buf[i], n - i);
+		}
+	}
+	else if (n == 0 || errno != EAGAIN) {
+		// 需要关闭
+		client->state = j;
+	}
+}
+
+static void* copythread(void* data) {
+	int ret;
+	struct epoll_event events[MAX_EVENTS];
+	for (; (ret = epoll_wait(data, events, MAX_EVENTS, -1)) > 0;) {
+		size_t i;
+		for (i = 0; i < ret; ++i) {
+			size_t idx = (unsigned long)events[i].data.ptr & 1;
+			struct client* client = (unsigned long)events[i].data.ptr & ~1;
+			if (client->state != SS_3_AUTHED) { continue; }
+			if (events[i].events & EPOLLIN) { copyloop(client, idx, i); }
+			if (events[i].events & EPOLLOUT) { copyloop(client, !idx, i); }
+		}
+		for (i = 0; i < ret; ++i) {
+			struct client* client = (unsigned long)events[i].data.ptr & ~1;
+			if (client->state == i) {	// 仅关闭一次
+				close(client->fd[0]);
+				close(client->fd[1]);
+				client->state = SS_CLEANUP;
+			}
+		}
+    }
+    perror("epoll_pwait");
+	return -1;
+}
+
+static void collect(sblist* threads) {
+	size_t i;
+	for (i = sblist_getsize(threads); i-- > 0;) {
+		struct client* client = *((struct client**)sblist_get(threads, i));
+		if (client->state == SS_CLEANUP) {
 			sblist_delete(threads, i);
-			pthread_join(thread->pt, 0);
-			free(thread);
+			pthread_join(client->pt, 0);
+			free(client);
 		}
 	}
 }
@@ -384,14 +431,12 @@ static int server_listen(struct addrinfo* addr) {
 	int fd = -1, reuse = 1;
 	struct addrinfo* p;
 	for (p = addr; p; p = p->ai_next) {
-		if ((fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) { continue; }
-		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-		if (bind(fd, p->ai_addr, p->ai_addrlen) || listen(fd, SOMAXCONN)) {
+		if ((fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0
+			|| setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))
+			|| bind(fd, p->ai_addr, p->ai_addrlen) || listen(fd, SOMAXCONN)) {
 			close(fd);
 			fd = -1;
-			continue;
-		}
-		break;
+		} else { break; }
 	}
 	freeaddrinfo(addr);
 	return fd;
@@ -407,7 +452,7 @@ static void usage(void) {
 	dprintf(2,
 		"MicroSocks SOCKS5 Server\n"
 		"------------------------\n"
-		"usage: microsocks -1 -i listenip -p port -u user -P password -b bindaddr\n"
+		"usage: microsocks  -b bindaddr -i listenip -p port -u user -P password -1\n"
 		"all arguments are optional.\n"
 		"by default listenip is 0.0.0.0 and port 1080.\n\n"
 		"option -b specifies which ip outgoing connections are bound to\n"
@@ -433,7 +478,7 @@ static struct addrinfo* param_resolve(int argc, char* argv[]) {
 	const char* listen_port = "1080";
 	// 解析参数
 	int ch;
-	for (; (ch = getopt(argc, argv, ":b:i:p:u:P:1")) != -1; ) {
+	for (; (ch = getopt(argc, argv, ":b:i:p:u:P:1")) >= 0; ) {
 		switch (ch) {
 			case 'i':
 				listen_ip = optarg;
@@ -468,7 +513,7 @@ static struct addrinfo* param_resolve(int argc, char* argv[]) {
 				return 0;
 		}
 	}
-	if ((auth_user && !auth_pass) || (!auth_user && auth_pass)) {
+	if (!auth_user ^ !auth_pass) {
 		dprintf(2, "error: user and pass must be used together\n");
 		return 0;
 	}
@@ -490,61 +535,65 @@ static void quit(int signum) {
 	longjmp(jmpbuf, -1);
 }
 int main(int argc, char* argv[]) {
-	// 创建ArrayList，查看元素
-	sblist* threads = sblist_new(sizeof(struct thread*), 8);
-	if (!threads) {
-		perror("sblist_new");
+	int listen_fd, epoll_fd;
+	if ((listen_fd = server_listen(param_resolve(argc, argv))) < 0
+		|| (epoll_fd = epoll_create(MAX_EVENTS)) < 0) {
+		perror("server_listen/epoll_create");
+		close(listen_fd);
 		return -1;
 	}
 
-	// 对端close后，避免调用write进程退出
-	signal(SIGPIPE, SIG_IGN);
-	int fd = server_listen(param_resolve(argc, argv));
-	if (fd == -1) {
-		free(threads);
-		perror("server_setup");
+	pthread_t pthread;
+	if (pthread_create(&pthread, 0, copythread, epoll_fd)) {
+		perror("pthread_create");
+		close(epoll_fd);
+		close(listen_fd);
 		return -2;
 	}
+
+	// 创建ArrayList，查看元素
+	sblist* threads;
+	if (!(threads = sblist_new(sizeof(struct client*), 8))) {
+		perror("sblist_new");
+		goto exit;
+	}
+
 	// 注册退出函数
-	if (setjmp(jmpbuf) || signal(SIGINT, quit) == SIG_ERR) {
+	if (setjmp(jmpbuf) || signal(SIGINT, quit) == SIG_ERR
+		|| signal(SIGPIPE, SIG_IGN) == SIG_ERR) {// 对端close后，避免调用write进程退出
 		perror("setjmp/signal");
 		goto exit;
 	}
 	for (;;) {
-		struct thread* thread = malloc(sizeof(struct thread));
-		socklen_t addrlen = sizeof(thread->client.addr);
-		if (!thread || (thread->client.fd = accept(fd, (struct sockaddr*)&thread->client.addr, &addrlen)) == -1) {
-			dolog("rejecting connection due to OOM\n");
-			goto oom;
+		struct client* client;
+		for (; (client = malloc(sizeof(struct client)))
+			&& (client->fd[0] = accept(listen_fd, 0, 0)) >= 0;) {
+			client->fd[1] = epoll_fd;
+			client->state = SS_1_CONNECTED;
+			collect(threads);
+			pthread_attr_t attr;
+			if (!pthread_attr_init(&attr)) {
+				if (pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE)
+					|| pthread_create(&client->pt, &attr, clientthread, client)) {
+					dolog("pthread_attr/create failed. OOM?\n");
+					pthread_attr_destroy(&attr);
+					close(client->fd[0]);
+					break;
+				}
+				pthread_attr_destroy(&attr);
+				if (!sblist_add(threads, &client)) {
+					dolog("sblist_add failed. OOM?\n");
+					pthread_join(client->pt, 0);	// 等待该线程结束
+				}
+			}
 		}
-
-		thread->done = 0;
-		pthread_attr_t attr;
-		if (pthread_attr_init(&attr)) {
-			close(thread->client.fd);
-			goto oom;
-		}
-		if (pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE)
-			|| pthread_create(&thread->pt, &attr, clientthread, thread)) {
-			dolog("pthread_attr/create failed. OOM?\n");
-			pthread_attr_destroy(&attr);
-			close(thread->client.fd);
-		oom:
-			free(thread);
-			usleep(16); /* prevent 100% CPU usage in OOM situation */
-			continue;
-		}
-		pthread_attr_destroy(&attr);
-
-		collect(threads);
-		if (!sblist_add(threads, &thread)) {
-			dolog("sblist_add failed. OOM?\n");
-			pthread_join(thread->pt, 0);
-			free(thread);
-		}
+		dolog("rejecting connection due to OOM\n");
+		free(client);
+		usleep(16); /* prevent 100% CPU usage in OOM situation */
 	}
 exit:
-	close(fd);
 	free(threads);
+	close(epoll_fd);
+	close(listen_fd);
 	return 0;
 }
