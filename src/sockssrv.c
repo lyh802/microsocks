@@ -24,21 +24,23 @@
 #define _GNU_SOURCE
 #include <unistd.h>
 #define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <pthread.h>
 #include <signal.h>
-#include <setjmp.h>
+#include <pthread.h>
 #include <netdb.h>
-#include <sys/epoll.h>
 #include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <errno.h>
 #include <limits.h>
 #include "sblist.h"
 
+#define MAX_RETRIES 1
+#define MAX_THREADS -1
+
 #define MAX_EVENTS 128
-#define THREAD_BUFFER_SIZE 2048
+#define THREAD_BUFFER_SIZE 1460
 
 #ifndef MAX
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
@@ -63,10 +65,12 @@
 #endif
 
 enum socksstate {
-	SS_1_CONNECTED = -4,
-	SS_2_NEED_AUTH = -3, /* skipped if NO_AUTH method supported */
-	SS_3_AUTHED = -2,
-	SS_CLEANUP = -1,
+	SS_ESTABLISHED = -2,
+	SS_CLOSED = -1,
+	SS_CLOSING = 0,	// 所有其他值都代表SS_CLOSING
+	SS_1_CONNECTED,
+	SS_2_NEED_AUTH, /* skipped if NO_AUTH method supported */
+	SS_3_AUTHED,
 };
 
 enum addresstype {
@@ -79,7 +83,7 @@ enum authmethod {
 	AM_NO_AUTH = 0,
 	AM_GSSAPI = 1,
 	AM_USERNAME = 2,
-	AM_INVALID = 0xFF,
+	AM_INVALID = -1,
 };
 
 enum errorcode {
@@ -104,8 +108,11 @@ union sockaddr_union {
 #define SOCKADDR_UNION_LENGTH(PTR) (\
 	(SOCKADDR_UNION_AF(PTR) == AF_INET6) ? sizeof((PTR)->v6) : sizeof((PTR)->v4))
 
-#define SOCKADDR_UNION_ADDRESS(PTR) (struct sockaddr*)(\
-	(SOCKADDR_UNION_AF(PTR) == AF_INET6) ? &(PTR)->v6.sin6_addr : &(PTR)->v4.sin_addr)
+#define SOCKADDR_UNION_ADDRESS(PTR) (\
+	(SOCKADDR_UNION_AF(PTR) == AF_INET6) ? (struct sockaddr *)&(PTR)->v6.sin6_addr : (struct sockaddr *)&(PTR)->v4.sin_addr)
+
+#define SOCKADDR_UNION_PORT(PTR) (\
+	(SOCKADDR_UNION_AF(PTR) == AF_INET6) ? &(PTR)->v6.sin6_port : &(PTR)->v4.sin_port)
 
 struct buffer {
 	size_t count;
@@ -114,15 +121,15 @@ struct buffer {
 };
 
 struct client {
-	volatile int state;
 	int fd[2];
-	struct buffer* ptr[2];
+	volatile int state;
+	struct buffer *ptr[2];
 	pthread_t pt;
 };
 
-static const char* auth_user = 0;
-static const char* auth_pass = 0;
-static sblist* auth_ips = 0;
+static const char *auth_user = 0;
+static const char *auth_pass = 0;
+static sblist *auth_ips = 0;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static union sockaddr_union bind_addr = { .v4.sin_family = AF_UNSPEC, };
 
@@ -135,59 +142,17 @@ static union sockaddr_union bind_addr = { .v4.sin_family = AF_UNSPEC, };
    which writes directly to an fd. */
 #define dolog(...) dprintf(2, __VA_ARGS__)
 #else
-static void dolog(const char* fmt, ...) { }
+static void dolog(const char *fmt, ...) { }
 #endif
 
-static int connect_socks_target(union sockaddr_union* client, uint8_t* buf, size_t n) {
-	// 头部固定4字节
-	if (n < 4 || buf[0] != 5 || buf[2] != 0) { return -EC_GENERAL_FAILURE; /* malformed packet */ }
-	if (buf[1] != 1) { return -EC_COMMAND_NOT_SUPPORTED; /* we support only CONNECT method */ }
-
-	int ret = AF_INET;
-	size_t i = 4 + 4;	// 端口
-	char port[6];
-	switch (buf[3]) {
-		case AT_IPV6: /* ipv6 */
-			ret = AF_INET6;
-			i = 4 + 16;
-			/* fall through */
-		case AT_IPV4: /* ipv4 */
-			if (i + 2 > n) { return -EC_GENERAL_FAILURE; }
-			snprintf(port, sizeof(port), "%u", ntohs(*(uint16_t*)&buf[i]));
-			if (!inet_ntop(ret, &buf[4], (char*)&buf[i + 2], INET6_ADDRSTRLEN)) {	// IPV6最大长度为4+16+2+45(+1)
-				return -EC_GENERAL_FAILURE; /* malformed or too long addr */
-			}
-			i = i + 2;	// host
-			break;
-		case AT_DNS: /* dns name */
-			i = 4 + 1 + buf[4];
-			if (i + 2 > n) { return -EC_GENERAL_FAILURE; }	// DNS最大长度为4+1+255+2
-			snprintf(port, sizeof(port), "%u", ntohs(*(uint16_t*)&buf[i]));
-			buf[i] = 0;	// 原始host结束符
-			i = 4 + 1;	// host
-			break;
-		default:
-			return -EC_ADDRESSTYPE_NOT_SUPPORTED;
-	}
-
-	struct addrinfo hints = {
-		.ai_flags = AI_ADDRCONFIG,
-		.ai_family = SOCKADDR_UNION_AF(&bind_addr),
-		.ai_socktype = SOCK_STREAM,
-		.ai_protocol = 0,
-	};
-	struct addrinfo* addr;
-	/* there's no suitable errorcode in rfc1928 for dns lookup failure */
-	if (getaddrinfo((char*)&buf[i], port, &hints, &addr)) {
-		perror("resolve");
-		return -EC_GENERAL_FAILURE;
-	}
-	if ((ret = socket(addr->ai_family, addr->ai_socktype, 0)) < 0
+static int socks5_connect(union sockaddr_union *remote, int ai_socktype) {
+	int ret;
+	if ((ret = socket(SOCKADDR_UNION_AF(remote), ai_socktype, 0)) < 0
 		|| (SOCKADDR_UNION_AF(&bind_addr) != AF_UNSPEC
-		&& bind(ret, (struct sockaddr*)&bind_addr, SOCKADDR_UNION_LENGTH(&bind_addr)))
-		|| connect(ret, addr->ai_addr, addr->ai_addrlen)) {
+		&& bind(ret, (struct sockaddr *)&bind_addr, SOCKADDR_UNION_LENGTH(&bind_addr)))
+		|| connect(ret, (struct sockaddr *)remote, SOCKADDR_UNION_LENGTH(remote))) {
+		perror("socket/bind/connect");
 		close(ret);
-		freeaddrinfo(addr);
 		switch(errno) {
 			case ETIMEDOUT:
 				return -EC_TTL_EXPIRED;
@@ -204,41 +169,99 @@ static int connect_socks_target(union sockaddr_union* client, uint8_t* buf, size
 				return -EC_HOST_UNREACHABLE;
 			case EBADF:
 			default:
-				perror("socket/connect");
 				return -EC_GENERAL_FAILURE;
 		}
-	}
-	freeaddrinfo(addr);
-
-	if(CONFIG_LOG) {
-		char name[256];
-		inet_ntop(SOCKADDR_UNION_AF(client), SOCKADDR_UNION_ADDRESS(client), name, sizeof(name));
-		dolog("client %s: connected to %s:%s\n", name, (char*)&buf[i], port);
 	}
 	return ret;
 }
 
-static int is_authed(union sockaddr_union* addr, union sockaddr_union* authed) {
-	if (SOCKADDR_UNION_AF(addr) != SOCKADDR_UNION_AF(authed)
-		|| memcmp(addr, authed, SOCKADDR_UNION_LENGTH(authed))) {
+static int socks5_proxy(union sockaddr_union *client, uint8_t *buf, size_t n) {
+#if CONFIG_LOG
+	inet_ntop(SOCKADDR_UNION_AF(client), SOCKADDR_UNION_ADDRESS(client), (char *)&buf[4+1+255+2], INET6_ADDRSTRLEN);
+#endif
+	// 头部固定4字节
+	if (n < 4 || buf[0] != 5 || buf[2] != 0) { return -EC_GENERAL_FAILURE; /* malformed packet */ }
+	if (buf[1] != 1) { return -EC_COMMAND_NOT_SUPPORTED; /* we support only CONNECT method */ }
+
+	int ret = AF_INET;
+	size_t i = 4 + 4;	// 端口
+	union sockaddr_union *remote = (union sockaddr_union *)&buf[32];
+	switch (buf[3]) {
+		case AT_IPV6: /* ipv6 */
+			ret = AF_INET6;
+			i = 4 + 16;
+			remote->v6.sin6_flowinfo = 0;
+			remote->v6.sin6_scope_id = 0;
+			/* fall through */
+		case AT_IPV4: /* ipv4 */
+			if (i + 2 > n) { return -EC_GENERAL_FAILURE; }	// IPV6最大长度为4+16+2
+
+			memset(remote->v4.sin_zero, 0, sizeof(remote->v4.sin_zero));
+			memcpy(SOCKADDR_UNION_ADDRESS(remote), &buf[4], i - 4);
+			*SOCKADDR_UNION_PORT(remote) = *(uint16_t *)&buf[i];
+			SOCKADDR_UNION_AF(remote) = ret;
+		#if CONFIG_LOG
+			inet_ntop(SOCKADDR_UNION_AF(remote), SOCKADDR_UNION_ADDRESS(remote), (char *)&buf[64], INET6_ADDRSTRLEN);
+			dolog("client %s: connected to %s:%d\n", (char *)&buf[4+1+255+2], (char *)&buf[64], ntohs(*SOCKADDR_UNION_PORT(remote)));
+		#endif
+			return socks5_connect(remote, SOCK_STREAM);
+		case AT_DNS: /* dns name */
+			i = 4 + 1 + buf[4];
+			if (i + 2 > n) { return -EC_GENERAL_FAILURE; }	// DNS最大长度为4+1+255+2
+
+			uint16_t port = *(uint16_t *)&buf[i];
+			buf[i] = 0;	// 设置host结束符
+			struct addrinfo *p, *addr, hints = {
+				.ai_flags = AI_ADDRCONFIG,
+				.ai_family = SOCKADDR_UNION_AF(&bind_addr),
+				.ai_socktype = SOCK_STREAM,
+				.ai_protocol = 0,
+			};
+		#if CONFIG_LOG
+			dolog("client %s: connected to %s:%d\n", (char *)&buf[4+1+255+2], (char *)&buf[4+1], ntohs(port));
+		#endif
+			/* there's no suitable errorcode in rfc1928 for dns lookup failure */
+			ret = getaddrinfo((char *)&buf[4+1], 0, &hints, &addr);
+			*(uint16_t *)&buf[i] = port;	// 恢复原始数据
+			if (ret) {
+				dolog("proxy_resolve: %s\n", gai_strerror(ret));
+				return -EC_GENERAL_FAILURE;
+			}
+			for (i = MAX_RETRIES, p = addr; p; p = p->ai_next) {
+				//dolog("retry: %d, next: %d\n", i, p->ai_next);
+				*SOCKADDR_UNION_PORT((union sockaddr_union *)p->ai_addr) = port;
+				if ((ret = socks5_connect((union sockaddr_union *)p->ai_addr, p->ai_socktype)) >= 0 || !i--) {
+					break;
+				}
+			}
+			freeaddrinfo(addr);
+			return ret;
+		default:
+			return -EC_ADDRESSTYPE_NOT_SUPPORTED;
+	}
+}
+
+static int is_authed(union sockaddr_union *client, union sockaddr_union *authed) {
+	if (SOCKADDR_UNION_AF(client) != SOCKADDR_UNION_AF(authed)
+		|| memcmp(client, authed, SOCKADDR_UNION_LENGTH(authed))) {
 		return 0;
 	}
 	return 1;
 }
 
-static int is_in_authed_list(union sockaddr_union* addr) {
+static int is_in_authed_list(union sockaddr_union *client) {
 	size_t i;
 	for (i = sblist_getsize(auth_ips); i-- > 0;) {
-		if (is_authed(addr, sblist_get(auth_ips, i))) { return 1; }
+		if (is_authed(client, sblist_get(auth_ips, i))) { return 1; }
 	}
 	return 0;
 }
 
-static void add_auth_ip(union sockaddr_union* addr) {
-	sblist_add(auth_ips, addr);
+static void add_auth_ip(union sockaddr_union *client) {
+	sblist_add(auth_ips, client);
 }
 
-static enum authmethod check_auth_method(union sockaddr_union* addr, uint8_t* buf, size_t n) {
+static enum authmethod check_auth_method(union sockaddr_union *client, uint8_t *buf, size_t n) {
 	// 头部固定2字节
 	if (n < 2 || buf[0] != 5) { return AM_INVALID; }
 	for (n = MIN(n, buf[1] + 2); n-- > 2;) {
@@ -248,7 +271,7 @@ static enum authmethod check_auth_method(union sockaddr_union* addr, uint8_t* bu
 				else if (auth_ips) {
 					int authed = 0;
 					if (!pthread_rwlock_rdlock(&auth_ips_lock)) {
-						authed = is_in_authed_list(addr);
+						authed = is_in_authed_list(client);
 						pthread_rwlock_unlock(&auth_ips_lock);
 					}
 					if (authed) { return AM_NO_AUTH; }
@@ -264,37 +287,37 @@ static enum authmethod check_auth_method(union sockaddr_union* addr, uint8_t* bu
 	return AM_INVALID;
 }
 
-static enum errorcode check_credentials(uint8_t* buf, size_t n) {
-	// 至少3个字节
-	if (n < 3 || buf[0] != 1) { return EC_GENERAL_FAILURE; }
+static enum errorcode check_credentials(uint8_t *buf, size_t n) {
+	// 至少2个字节
+	if (n < 2 || buf[0] != 1) { return EC_GENERAL_FAILURE; }
 	uint8_t ulen, plen;
 	if (n < 2 + (ulen = buf[1]) + 1
-		|| n < 2 + ulen + 1 + (plen = buf[2 + ulen])) { return EC_GENERAL_FAILURE; }	// 最大长度为2+255+1+255(+1)
-	buf[2 + ulen] = 0;	// 原始user结束符
-	buf[2 + ulen + 1 + plen] = 0;	// 原始pass结束符
-	if (strcmp((char*)&buf[2], auth_user) || strcmp((char*)&buf[2 + ulen + 1], auth_pass)) { return EC_NOT_ALLOWED; }
+		|| n < 2 + ulen + 1 + (plen = buf[2+ulen])) { return EC_GENERAL_FAILURE; }	// 最大长度为2+255+1+255(+1)
+	buf[2+ulen] = 0;	// 原始user结束符
+	buf[2+ulen+1+plen] = 0;	// 原始pass结束符
+	if (strcmp((char *)&buf[2], auth_user) || strcmp((char *)&buf[2+ulen+1], auth_pass)) { return EC_NOT_ALLOWED; }
 	return EC_SUCCESS;
 }
 
-static void send_auth_response(int fd, uint8_t* buf, enum errorcode code) {
+static void send_auth_response(int fd, uint8_t *buf, enum errorcode code) {
 	buf[1] = code;
 	send(fd, buf, 2, 0);
 }
 
-static void send_code(int fd, uint8_t* buf, enum errorcode code) {
+static void send_code(int fd, uint8_t *buf, enum errorcode code) {
 	/* position 4 contains ATYP, the address type, which is the same as used in the connect
 	   request. we're lazy and return always IPV4 address type in errors. */
 	buf[1] = code; buf[3] = AT_IPV4; /*AT_IPV4*/
 	send(fd, buf, 4 + 4 + 2, 0);
 }
 
-static void* clientthread(void* data) {
-	struct client* client = data;
+static void *socks5_handle(void *data) {
+	struct client *client = data;
 	union sockaddr_union addr;
 	int ret = sizeof(addr), fd = client->fd[0];
-	if (getpeername(fd, (struct sockaddr*)&addr, (socklen_t*)&ret)) { goto breakloop; }
+	if (getpeername(fd, (struct sockaddr *)&addr, (socklen_t *)&ret)) { goto breakloop; }
 
-	uint8_t buf[4+1+255+2];
+	uint8_t buf[2+255+1+255+1];
 	for (; (ret = recv(fd, buf, sizeof(buf), 0)) > 0;) {
 		switch (client->state) {
 			case SS_1_CONNECTED:
@@ -313,34 +336,33 @@ static void* clientthread(void* data) {
 						if (!is_in_authed_list(&addr)) { add_auth_ip(&addr); }
 						pthread_rwlock_unlock(&auth_ips_lock);
 					}
-				}
-				else { goto breakloop; }
+				} else { goto breakloop; }
 				break;
 			case SS_3_AUTHED:
-				ret = connect_socks_target(&addr, buf, ret);
+				ret = socks5_proxy(&addr, buf, ret);
 				if (ret < 0) {
-					perror("connect_socks_target");
 					send_code(fd, buf, -ret);
-				}
-				else {
+				} else {
 					send_code(fd, buf, EC_SUCCESS);
-
+					client->state = SS_ESTABLISHED;
 					int epoll_fd = client->fd[1];
 					client->fd[1] = ret;
 					client->ptr[0] = 0;
 					client->ptr[1] = 0;
 					struct epoll_event ev = {
-						.events = EPOLLIN | EPOLLOUT | EPOLLET,
-						.data.ptr = (unsigned long)client | 0,
+						.events = EPOLLET | EPOLLOUT | EPOLLIN,
+						.data.ptr = (unsigned long)client | 0UL,
 					};
 					if (!epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev)) {
-						ev.data.ptr = (unsigned long)client | 1;
+						ev.data.ptr = (unsigned long)client | 1UL;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ret, &ev)) {
-							perror("epoll_ctl: add1");
+							perror("epoll_add1");
+							shutdown(ret, SHUT_RDWR);
+							shutdown(fd, SHUT_RDWR);
 						}
 						return 0;
-                    }
-					perror("epoll_ctl: add0");
+					}
+					perror("epoll_add0");
 					close(ret);
 				}
 				/* fall through */
@@ -350,100 +372,28 @@ static void* clientthread(void* data) {
 	}
 breakloop:
 	close(fd);
-	client->state = SS_CLEANUP;
-	return -1;
+	client->state = SS_CLOSED;
+	return (void *)-1;
 }
 
-static void copyloop(struct client* client, uint8_t idx, size_t j) {
-	uint8_t buf[THREAD_BUFFER_SIZE];
-	size_t i;
-	ssize_t n, t;
-	if (client->ptr[idx]) {
-		// 仍有数据待发送
-		i = client->ptr[idx]->count;
-		n = client->ptr[idx]->capacity;
-		for (; i < n && (t = send(client->fd[!idx], &buf[i], n - i, MSG_DONTWAIT)) > 0; i += t) {}
-		if (i < n) {
-			client->ptr[idx]->count = i;
-		} else {
-			free(client->ptr[idx]);
-			client->ptr[idx] = 0;
-		}
-	}
-	if (!client->ptr[idx]) {
-		for (; (n = recv(client->fd[idx], buf, sizeof(buf), MSG_DONTWAIT)) > 0;) {
-			for (i = 0; i < n && (t = send(client->fd[!idx], &buf[i], n - i, MSG_DONTWAIT)) > 0; i += t) {}
-			if (i < n) { break; }
-		}
-	}
-	if (n > 0) {
-		// 数据未发完
-		if (client->ptr[idx] = malloc(sizeof(struct buffer))) {
-			client->ptr[idx]->count = 0;
-			client->ptr[idx]->capacity = n - i;
-			memcpy(client->ptr[idx]->data, &buf[i], n - i);
-		}
-	}
-	else if (n == 0 || errno != EAGAIN) {
-		// 需要关闭
-		client->state = j;
-	}
-}
-
-static void* copythread(void* data) {
-	int ret;
-	struct epoll_event events[MAX_EVENTS];
-	for (; (ret = epoll_wait(data, events, MAX_EVENTS, -1)) > 0;) {
-		size_t i;
-		for (i = 0; i < ret; ++i) {
-			size_t idx = (unsigned long)events[i].data.ptr & 1;
-			struct client* client = (unsigned long)events[i].data.ptr & ~1;
-			if (client->state != SS_3_AUTHED) { continue; }
-			if (events[i].events & EPOLLIN) { copyloop(client, idx, i); }
-			if (events[i].events & EPOLLOUT) { copyloop(client, !idx, i); }
-		}
-		for (i = 0; i < ret; ++i) {
-			struct client* client = (unsigned long)events[i].data.ptr & ~1;
-			if (client->state == i) {	// 仅关闭一次
-				close(client->fd[0]);
-				close(client->fd[1]);
-				client->state = SS_CLEANUP;
-			}
-		}
-    }
-    perror("epoll_pwait");
-	return -1;
-}
-
-static void collect(sblist* threads) {
-	size_t i;
-	for (i = sblist_getsize(threads); i-- > 0;) {
-		struct client* client = *((struct client**)sblist_get(threads, i));
-		if (client->state == SS_CLEANUP) {
-			sblist_delete(threads, i);
-			pthread_join(client->pt, 0);
-			free(client);
-		}
-	}
-}
-
-static int server_listen(struct addrinfo* addr) {
-	int fd = -1, reuse = 1;
-	struct addrinfo* p;
+static int server_listen(struct addrinfo *addr) {
+	int ret = -1, reuse = 1;
+	struct addrinfo *p;
 	for (p = addr; p; p = p->ai_next) {
-		if ((fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0
-			|| setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))
-			|| bind(fd, p->ai_addr, p->ai_addrlen) || listen(fd, SOMAXCONN)) {
-			close(fd);
-			fd = -1;
+		// 非阻塞
+		if ((ret = socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol)) < 0
+			|| setsockopt(ret, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse))
+			|| bind(ret, p->ai_addr, p->ai_addrlen) || listen(ret, SOMAXCONN)) {
+			close(ret);
+			ret = -1;
 		} else { break; }
 	}
 	freeaddrinfo(addr);
-	return fd;
+	return ret;
 }
 
 /* prevent username and password from showing up in top. */
-static void fill_zero(char* s) {
+static void fill_zero(char *s) {
 	size_t i;
 	for (i = 0; s[i]; ++i) s[i] = 0;
 }
@@ -465,7 +415,7 @@ static void usage(void) {
 	);
 }
 
-static struct addrinfo* param_resolve(int argc, char* argv[]) {
+static struct addrinfo *param_resolve(int argc, char *argv[]) {
 	// 解析TCP地址，AI_PASSIVE置位，0返回通配地址
 	static const struct addrinfo hints = {
 		.ai_flags = AI_ADDRCONFIG | AI_PASSIVE,
@@ -473,13 +423,13 @@ static struct addrinfo* param_resolve(int argc, char* argv[]) {
 		.ai_socktype = SOCK_STREAM,
 		.ai_protocol = 0,
 	};
-	struct addrinfo* addr;
-	const char* listen_ip = 0;
-	const char* listen_port = "1080";
+	struct addrinfo *addr;
+	const char *listen_ip = 0;
+	const char *listen_port = "1080";
 	// 解析参数
-	int ch;
-	for (; (ch = getopt(argc, argv, ":b:i:p:u:P:1")) >= 0; ) {
-		switch (ch) {
+	int ret;
+	for (; (ret = getopt(argc, argv, ":b:i:p:u:P:1")) >= 0; ) {
+		switch (ret) {
 			case 'i':
 				listen_ip = optarg;
 				break;
@@ -487,8 +437,8 @@ static struct addrinfo* param_resolve(int argc, char* argv[]) {
 				listen_port = optarg;
 				break;
 			case 'b':
-				if (getaddrinfo(optarg, 0, &hints, &addr)) {
-					perror("bindaddr_resolve");
+				if ((ret = getaddrinfo(optarg, 0, &hints, &addr))) {
+					dolog("bind_resolve: %s\n", gai_strerror(ret));
 					return 0;
 				}
 				memcpy(&bind_addr, addr->ai_addr, addr->ai_addrlen);
@@ -523,77 +473,183 @@ static struct addrinfo* param_resolve(int argc, char* argv[]) {
 	}
 
 	// 解析TCP地址
-	if (getaddrinfo(listen_ip, listen_port, &hints, &addr)) {
-		perror("listenaddr_resolve");
+	if ((ret = getaddrinfo(listen_ip, listen_port, &hints, &addr))) {
+		dolog("listen_resolve: %s\n", gai_strerror(ret));
 		return 0;
 	}
 	return addr;
 }
 
-static jmp_buf jmpbuf;
-static void quit(int signum) {
-	longjmp(jmpbuf, -1);
+static int client_handle(struct client *client, uint8_t instance) {
+	size_t i;
+	ssize_t n, t;
+	uint8_t buf[THREAD_BUFFER_SIZE];
+	if (client->ptr[instance]) {
+		// 仍有数据待发送
+		i = client->ptr[instance]->count;
+		n = client->ptr[instance]->capacity;
+		for (; i < n; i += t) {
+			t = send(client->fd[!instance], &client->ptr[instance]->data[i], n - i, MSG_DONTWAIT);
+			if (t < 0 && errno == EAGAIN) {
+				client->ptr[instance]->count = i;
+				return 0;
+			} else if (t <= 0) { return -1; }
+		}
+		free(client->ptr[instance]);
+		client->ptr[instance] = 0;
+	}
+	for (; (n = recv(client->fd[instance], buf, sizeof(buf), MSG_DONTWAIT)) > 0;) {
+		for (i = 0; i < n; i += t) {
+			t = send(client->fd[!instance], &buf[i], n - i, MSG_DONTWAIT);
+			if (t < 0 && errno == EAGAIN) {
+				// 数据未发完
+				if (!(client->ptr[instance] = malloc(sizeof(struct buffer)))) {
+					dolog("client_handle failed. OOM?\n");
+					return -1;
+				}
+				client->ptr[instance]->count = 0;
+				client->ptr[instance]->capacity = n - i;
+				memcpy(client->ptr[instance]->data, &buf[i], n - i);
+				return 0;
+			} else if (t <= 0) { return -1; }
+		}
+	}
+	if (n < 0 && errno == EAGAIN) { return 0; }
+	// 需要关闭
+	return -1;
 }
-int main(int argc, char* argv[]) {
-	int listen_fd, epoll_fd;
-	if ((listen_fd = server_listen(param_resolve(argc, argv))) < 0
+
+static int server_handle(struct client *server, sblist *clients, size_t threads) {
+	int fd;
+	struct client *client;
+	for (; threads < MAX_THREADS
+		&& (fd = accept(server->fd[0], 0, 0)) >= 0
+		&& (client = malloc(sizeof(struct client))); ++threads) {
+		client->fd[0] = fd;
+		client->fd[1] = server->fd[1];
+		client->state = SS_1_CONNECTED;
+		if (!sblist_add(clients, &client)) {
+			dolog("sblist_add failed. OOM?\n");
+			goto oom;
+		}
+
+		pthread_attr_t attr;
+		if (!pthread_attr_init(&attr)) {
+			if (pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE)
+				|| pthread_create(&client->pt, &attr, socks5_handle, client)) {
+				dolog("pthread_attr/create failed. OOM?\n");
+				pthread_attr_destroy(&attr);
+				sblist_delete(clients, sblist_getsize(clients) - 1);
+				goto oom;
+			}
+			pthread_attr_destroy(&attr);
+		} else {
+			dolog("pthread_attr_init failed. OOM?\n");
+		oom:
+			free(client);
+			break;
+		}
+	}
+	if (threads >= MAX_THREADS) {
+		// 关闭监听
+		epoll_ctl(server->fd[1], EPOLL_CTL_DEL, server->fd[0], 0);
+		return server->fd[0];
+	} else if (fd >= 0) {
+		dolog("rejecting connection due to OOM\n");
+		close(fd);
+		// TODO:重新设置errno
+		errno = ENOMEM;
+	}
+	return -1;
+}
+
+int main(int argc, char *argv[]) {
+	int ret, epoll_fd;
+	sblist *clients = 0;
+	// 对端close后，避免调用write进程退出
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR
+		|| !(clients = sblist_new(sizeof(struct client *), 8))
 		|| (epoll_fd = epoll_create(MAX_EVENTS)) < 0) {
-		perror("server_listen/epoll_create");
-		close(listen_fd);
+		perror("signal/sblist_create/epoll_create");
+		free(clients);
 		return -1;
 	}
 
-	pthread_t pthread;
-	if (pthread_create(&pthread, 0, copythread, epoll_fd)) {
-		perror("pthread_create");
-		close(epoll_fd);
-		close(listen_fd);
-		return -2;
-	}
-
-	// 创建ArrayList，查看元素
-	sblist* threads;
-	if (!(threads = sblist_new(sizeof(struct client*), 8))) {
-		perror("sblist_new");
+	struct client *client, server = {
+		.fd[1] = epoll_fd,
+		.state = SS_CLOSED,
+	};
+	struct epoll_event events[MAX_EVENTS], ev = {
+		.events = EPOLLET | EPOLLIN,
+		.data.ptr = (unsigned long)&server | 0UL,
+	};
+	if ((server.fd[0] = server_listen(param_resolve(argc, argv))) < 0
+		|| epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server.fd[0], &ev)) {
+		perror("server_listen/epoll_add");
 		goto exit;
 	}
 
-	// 注册退出函数
-	if (setjmp(jmpbuf) || signal(SIGINT, quit) == SIG_ERR
-		|| signal(SIGPIPE, SIG_IGN) == SIG_ERR) {// 对端close后，避免调用write进程退出
-		perror("setjmp/signal");
-		goto exit;
-	}
-	for (;;) {
-		struct client* client;
-		for (; (client = malloc(sizeof(struct client)))
-			&& (client->fd[0] = accept(listen_fd, 0, 0)) >= 0;) {
-			client->fd[1] = epoll_fd;
-			client->state = SS_1_CONNECTED;
-			collect(threads);
-			pthread_attr_t attr;
-			if (!pthread_attr_init(&attr)) {
-				if (pthread_attr_setstacksize(&attr, THREAD_STACK_SIZE)
-					|| pthread_create(&client->pt, &attr, clientthread, client)) {
-					dolog("pthread_attr/create failed. OOM?\n");
-					pthread_attr_destroy(&attr);
-					close(client->fd[0]);
-					break;
+	for (; (ret = epoll_wait(epoll_fd, events, MAX_EVENTS, -1)) > 0;) {
+		size_t i, threads = 0;
+		// TODO: collect函数
+		for (i = sblist_getsize(clients); i-- > 0;) {
+			client = *((struct client **)sblist_get(clients, i));
+			if (client->state == SS_CLOSED) {
+				// 清理线程
+				pthread_join(client->pt, 0);
+				// TODO: 从client中获取对应的server.fd，打开监听
+				epoll_ctl(server.fd[1], EPOLL_CTL_ADD, server.fd[0], &ev);
+				sblist_delete(clients, i);
+				free(client);
+			} else if (client->state != SS_ESTABLISHED) { ++threads; }
+		}
+		//dolog("Threads: %d\n", threads);
+
+		for (i = 0; i < ret; ++i) {
+			uint8_t instance = (unsigned long)events[i].data.ptr & 1UL;
+			client = (unsigned long)events[i].data.ptr & ~1UL;
+			// 出现错误
+			if ((events[i].events & (EPOLLHUP | EPOLLERR))) {
+				events[i].events |= EPOLLOUT | EPOLLIN;	// 由读写回调来处理错误
+			}
+			if (client->state == SS_ESTABLISHED) {
+				// 客户端
+				if ((events[i].events & EPOLLIN) && client_handle(client, instance)) {
+					client->state = SS_CLOSING;
 				}
-				pthread_attr_destroy(&attr);
-				if (!sblist_add(threads, &client)) {
-					dolog("sblist_add failed. OOM?\n");
-					pthread_join(client->pt, 0);	// 等待该线程结束
+				if ((events[i].events & EPOLLOUT) && client_handle(client, !instance)) {
+					client->state = SS_CLOSING;
 				}
+			} else if (client->state == SS_CLOSED) {
+				// 服务端
+				if ((events[i].events & EPOLLIN) && server_handle(client, clients, threads)) {}
+				// epoll_fd不用关闭
+				if (client->state == SS_CLOSING) {
+					client->fd[1] = -1;
+				}
+			} else { client->state = i; }	// 更新最后引用
+			// 需要关闭
+			if (client->state == SS_CLOSING) {
+				free(client->ptr[1]);
+				free(client->ptr[0]);
+				close(client->fd[1]);
+				close(client->fd[0]);
 			}
 		}
-		dolog("rejecting connection due to OOM\n");
-		free(client);
-		usleep(16); /* prevent 100% CPU usage in OOM situation */
-	}
+		for (i = 0; i < ret; ++i) {
+			client = (unsigned long)events[i].data.ptr & ~1UL;
+			// 无符号比较
+			if (client->state <= i) {
+				// TODO：清理资源
+				// 准备清理客户端线程
+				client->state = SS_CLOSED;
+			}
+		}
+    }
+    perror("epoll_pwait");
 exit:
-	free(threads);
+	close(server.fd[0]);
 	close(epoll_fd);
-	close(listen_fd);
+	free(clients);
 	return 0;
 }
