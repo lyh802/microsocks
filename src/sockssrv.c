@@ -65,12 +65,12 @@
 #endif
 
 enum socksstate {
-	SS_ESTABLISHED = -2,
-	SS_CLOSED = -1,
+	SS_1_CONNECTED = -5,
+	SS_2_NEED_AUTH = -4, /* skipped if NO_AUTH method supported */
+	SS_3_AUTHED = -3,
+	SS_4_ESTABLISHED = -2,
+	SS_5_CLOSED = -1,
 	SS_CLOSING = 0,	// 所有其他值都代表SS_CLOSING
-	SS_1_CONNECTED,
-	SS_2_NEED_AUTH, /* skipped if NO_AUTH method supported */
-	SS_3_AUTHED,
 };
 
 enum addresstype {
@@ -344,7 +344,6 @@ static void *socks5_handle(void *data) {
 					send_code(fd, buf, -ret);
 				} else {
 					send_code(fd, buf, EC_SUCCESS);
-					client->state = SS_ESTABLISHED;
 					int epoll_fd = client->fd[1];
 					client->fd[1] = ret;
 					client->ptr[0] = 0;
@@ -353,16 +352,22 @@ static void *socks5_handle(void *data) {
 						.events = EPOLLET | EPOLLOUT | EPOLLIN,
 						.data.ptr = (unsigned long)client | 0UL,
 					};
-					if (!epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev)) {
+					if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev)) {
+						perror("epoll_add0");
+					} else {
 						ev.data.ptr = (unsigned long)client | 1UL;
+						// OLDFIXME: 1.epoll不成功未做处理，通讯不及时; 2.可能fd已关闭，操作了其他fd，目前无影响
+						//client->state = SS_4_ESTABLISHED;
 						if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, ret, &ev)) {
 							perror("epoll_add1");
-							shutdown(ret, SHUT_RDWR);
-							shutdown(fd, SHUT_RDWR);
+							//return (void *)-1;
+							// TODO: 必须main中清理资源
+						} else {
+							// FIXME: 已经触发过，通讯可能无法进行
+							client->state = SS_4_ESTABLISHED;
+							return 0;
 						}
-						return 0;
 					}
-					perror("epoll_add0");
 					close(ret);
 				}
 				/* fall through */
@@ -372,7 +377,7 @@ static void *socks5_handle(void *data) {
 	}
 breakloop:
 	close(fd);
-	client->state = SS_CLOSED;
+	client->state = SS_5_CLOSED;
 	return (void *)-1;
 }
 
@@ -459,6 +464,7 @@ static struct addrinfo *param_resolve(int argc, char *argv[]) {
 				dprintf(2, "error: option -%c requires an operand\n", optopt);
 				/* fall through */
 			case '?':
+			default:
 				usage();
 				return 0;
 		}
@@ -489,19 +495,19 @@ static int client_handle(struct client *client, uint8_t instance) {
 		i = client->ptr[instance]->count;
 		n = client->ptr[instance]->capacity;
 		for (; i < n; i += t) {
-			t = send(client->fd[!instance], &client->ptr[instance]->data[i], n - i, MSG_DONTWAIT);
-			if (t < 0 && errno == EAGAIN) {
+			if ((t = send(client->fd[!instance], &client->ptr[instance]->data[i], n - i, MSG_DONTWAIT)) > 0) {}
+			else if (t < 0 && errno == EAGAIN) {
 				client->ptr[instance]->count = i;
 				return 0;
-			} else if (t <= 0) { return -1; }
+			} else { return -1; }
 		}
 		free(client->ptr[instance]);
 		client->ptr[instance] = 0;
 	}
 	for (; (n = recv(client->fd[instance], buf, sizeof(buf), MSG_DONTWAIT)) > 0;) {
 		for (i = 0; i < n; i += t) {
-			t = send(client->fd[!instance], &buf[i], n - i, MSG_DONTWAIT);
-			if (t < 0 && errno == EAGAIN) {
+			if ((t = send(client->fd[!instance], &buf[i], n - i, MSG_DONTWAIT)) > 0) {}
+			else if (t < 0 && errno == EAGAIN) {
 				// 数据未发完
 				if (!(client->ptr[instance] = malloc(sizeof(struct buffer)))) {
 					dolog("client_handle failed. OOM?\n");
@@ -511,12 +517,11 @@ static int client_handle(struct client *client, uint8_t instance) {
 				client->ptr[instance]->capacity = n - i;
 				memcpy(client->ptr[instance]->data, &buf[i], n - i);
 				return 0;
-			} else if (t <= 0) { return -1; }
+			} else { return -1; }
 		}
 	}
 	if (n < 0 && errno == EAGAIN) { return 0; }
-	// 需要关闭
-	return -1;
+	else { return -1; }	// 需要关闭
 }
 
 static int server_handle(struct client *server, sblist *clients, size_t threads) {
@@ -553,14 +558,15 @@ static int server_handle(struct client *server, sblist *clients, size_t threads)
 	if (threads >= MAX_THREADS) {
 		// 关闭监听
 		epoll_ctl(server->fd[1], EPOLL_CTL_DEL, server->fd[0], 0);
-		return server->fd[0];
+		//return server->fd[0];
 	} else if (fd >= 0) {
 		dolog("rejecting connection due to OOM\n");
 		close(fd);
-		// TODO:重新设置errno
+		// TODO: 重新设置errno
 		errno = ENOMEM;
 	}
-	return -1;
+	return 0;
+	//return -1;
 }
 
 int main(int argc, char *argv[]) {
@@ -577,7 +583,7 @@ int main(int argc, char *argv[]) {
 
 	struct client *client, server = {
 		.fd[1] = epoll_fd,
-		.state = SS_CLOSED,
+		.state = SS_4_ESTABLISHED,
 	};
 	struct epoll_event events[MAX_EVENTS], ev = {
 		.events = EPOLLET | EPOLLIN,
@@ -594,55 +600,69 @@ int main(int argc, char *argv[]) {
 		// TODO: collect函数
 		for (i = sblist_getsize(clients); i-- > 0;) {
 			client = *((struct client **)sblist_get(clients, i));
-			if (client->state == SS_CLOSED) {
-				// 清理线程
-				pthread_join(client->pt, 0);
-				// TODO: 从client中获取对应的server.fd，打开监听
-				epoll_ctl(server.fd[1], EPOLL_CTL_ADD, server.fd[0], &ev);
-				sblist_delete(clients, i);
-				free(client);
-			} else if (client->state != SS_ESTABLISHED) { ++threads; }
+			switch (client->state) {
+				case SS_5_CLOSED:
+					// 主线程清理线程
+					pthread_join(client->pt, 0);
+					// TODO: 从client中获取对应的server.fd，打开监听
+					epoll_ctl(server.fd[1], EPOLL_CTL_ADD, server.fd[0], &ev);
+					sblist_delete(clients, i);
+					free(client);
+					/* fall through */
+				case SS_4_ESTABLISHED:
+					break;
+				default:
+					++threads;
+					break;
+			}
 		}
 		//dolog("Threads: %d\n", threads);
 
 		for (i = 0; i < ret; ++i) {
 			uint8_t instance = (unsigned long)events[i].data.ptr & 1UL;
 			client = (unsigned long)events[i].data.ptr & ~1UL;
-			// 出现错误
+			// 出现错误，由读写回调来处理错误
 			if ((events[i].events & (EPOLLHUP | EPOLLERR))) {
-				events[i].events |= EPOLLOUT | EPOLLIN;	// 由读写回调来处理错误
+				events[i].events |= EPOLLOUT | EPOLLIN;
 			}
-			if (client->state == SS_ESTABLISHED) {
-				// 客户端
-				if ((events[i].events & EPOLLIN) && client_handle(client, instance)) {
-					client->state = SS_CLOSING;
-				}
-				if ((events[i].events & EPOLLOUT) && client_handle(client, !instance)) {
-					client->state = SS_CLOSING;
-				}
-			} else if (client->state == SS_CLOSED) {
+			if (client->fd[1] == epoll_fd) {
 				// 服务端
-				if ((events[i].events & EPOLLIN) && server_handle(client, clients, threads)) {}
-				// epoll_fd不用关闭
-				if (client->state == SS_CLOSING) {
-					client->fd[1] = -1;
+				if (((events[i].events & EPOLLIN) && server_handle(client, clients, threads))) {
+					client->state = SS_CLOSING;
+					// epoll_fd不用关闭
+					close(client->fd[0]);
 				}
-			} else { client->state = i; }	// 更新最后引用
-			// 需要关闭
-			if (client->state == SS_CLOSING) {
-				free(client->ptr[1]);
-				free(client->ptr[0]);
-				close(client->fd[1]);
-				close(client->fd[0]);
+			} else {
+				// 客户端
+				switch (client->state) {
+					case SS_4_ESTABLISHED:
+						// 按位或运算
+						if (((events[i].events & EPOLLIN) && client_handle(client, instance))
+							| ((events[i].events & EPOLLOUT) && client_handle(client, !instance))) {
+							// 需要关闭
+							client->state = SS_CLOSING;
+							free(client->ptr[1]);
+							free(client->ptr[0]);
+							close(client->fd[1]);
+							close(client->fd[0]);
+						}
+						/* fall through */
+					case SS_3_AUTHED:
+					case SS_5_CLOSED:
+						break;
+					default:
+						client->state = i;	// 更新最后引用
+						break;
+				}
 			}
 		}
 		for (i = 0; i < ret; ++i) {
 			client = (unsigned long)events[i].data.ptr & ~1UL;
-			// 无符号比较
+			// 无符号比较，在最后引用清理
 			if (client->state <= i) {
-				// TODO：清理资源
-				// 准备清理客户端线程
-				client->state = SS_CLOSED;
+				// 标记待清理资源
+				client->state = SS_5_CLOSED;
+				// TODO: 能直接执行清理资源么?
 			}
 		}
     }
