@@ -34,10 +34,11 @@
 #include <sys/epoll.h>
 #include <errno.h>
 #include <limits.h>
+#include "sbholder.h"
 #include "sblist.h"
 
-#define MAX_RETRIES 1
-#define MAX_THREADS -1
+#define MAX_RETRIES 0
+#define MAX_THREADS 32
 
 #define MAX_EVENTS 128
 #define THREAD_BUFFER_SIZE 1460
@@ -121,7 +122,7 @@ struct buffer {
 
 struct client {
 	int fd[2];
-	struct buffer *ptr[2];
+	struct buffer *buf[2];
 	volatile int state;
 	pthread_t pt;
 };
@@ -312,12 +313,12 @@ static void send_code(int fd, uint8_t *buf, enum errorcode code) {
 
 static void *socks5_handle(void *data) {
 	struct client *client = data;
-	union sockaddr_union addr;
-	int ret = sizeof(addr), fd = client->fd[0], epoll_fd = client->fd[1];
 	struct epoll_event ev = {
 		.events = EPOLLET | EPOLLOUT | EPOLLIN,
 		.data.ptr = (unsigned long)client | 1UL,
 	};	// 置1后在main中变更状态
+	union sockaddr_union addr;
+	int ret = sizeof(addr), fd = client->fd[0], epoll_fd = client->fd[1];
 	if (getpeername(fd, (struct sockaddr *)&addr, (socklen_t *)&ret)) { goto breakloop; }
 
 	uint8_t buf[2+255+1+255+1];
@@ -471,36 +472,39 @@ static struct addrinfo *param_resolve(int argc, char *argv[]) {
 	return addr;
 }
 
-static int client_handle(struct client *client, uint8_t instance) {
+static int client_handle(struct client *client, uint8_t instance, sbHolder *buffers) {
 	size_t i;
 	ssize_t n, t;
-	uint8_t buf[THREAD_BUFFER_SIZE];
-	if (client->ptr[instance]) {
+	struct buffer *buffer;
+	if ((buffer = client->buf[instance])) {
 		// 仍有数据待发送
-		i = client->ptr[instance]->count;
-		n = client->ptr[instance]->capacity;
+		i = buffer->count;
+		n = buffer->capacity;
 		for (; i < n; i += t) {
-			if ((t = send(client->fd[!instance], &client->ptr[instance]->data[i], n - i, MSG_DONTWAIT)) > 0) {}
+			if ((t = send(client->fd[!instance], &buffer->data[i], n - i, MSG_DONTWAIT)) > 0) {}
 			else if (t < 0 && errno == EAGAIN) {
-				client->ptr[instance]->count = i;
+				buffer->count = i;
 				return 0;
 			} else { return -1; }
 		}
-		free(client->ptr[instance]);
-		client->ptr[instance] = 0;
+		if ((client->buf[instance] = sbholder_free(buffers, client->buf[instance]))) {
+			dolog("client_handle/free failed.\n");
+		}
 	}
+	uint8_t buf[THREAD_BUFFER_SIZE];
 	for (; (n = recv(client->fd[instance], buf, sizeof(buf), MSG_DONTWAIT)) > 0;) {
 		for (i = 0; i < n; i += t) {
 			if ((t = send(client->fd[!instance], &buf[i], n - i, MSG_DONTWAIT)) > 0) {}
 			else if (t < 0 && errno == EAGAIN) {
 				// 数据未发完
-				if (!(client->ptr[instance] = malloc(sizeof(struct buffer)))) {
-					dolog("client_handle failed. OOM?\n");
+				if (!(buffer = sbholder_alloc(buffers))) {
+					dolog("client_handle/alloc failed. OOM?\n");
 					return -1;
 				}
-				client->ptr[instance]->count = 0;
-				client->ptr[instance]->capacity = n - i;
-				memcpy(client->ptr[instance]->data, &buf[i], n - i);
+				client->buf[instance] = buffer;
+				buffer->count = 0;
+				buffer->capacity = n - i;
+				memcpy(buffer->data, &buf[i], n - i);
 				return 0;
 			} else { return -1; }
 		}
@@ -509,16 +513,16 @@ static int client_handle(struct client *client, uint8_t instance) {
 	else { return -1; }	// 需要关闭
 }
 
-static int server_handle(struct client *server) {
+static int server_handle(struct client *server, sbHolder *clients) {
 	int fd, epoll_fd = server->fd[1];
 	struct client *client;
 	for (; server->pt < MAX_THREADS
 		&& (fd = accept(server->fd[0], 0, 0)) >= 0
-		&& (client = malloc(sizeof(struct client))); ++server->pt) {
+		&& (client = sbholder_alloc(clients)); ++server->pt) {
 		client->fd[0] = fd;
 		client->fd[1] = epoll_fd;
-		client->ptr[0] = 0;
-		client->ptr[1] = 0;
+		client->buf[0] = 0;
+		client->buf[1] = 0;
 		client->state = SS_1_CONNECTED;
 		struct epoll_event ev = {
 			.events = EPOLLET | EPOLLOUT | EPOLLIN,
@@ -541,7 +545,7 @@ static int server_handle(struct client *server) {
 		} else {
 			dolog("pthread_attr_init failed. OOM?\n");
 		oom:
-			free(client);
+			sbholder_free(clients, client);
 			break;
 		}
 	}
@@ -551,7 +555,7 @@ static int server_handle(struct client *server) {
 		close(fd);
 		// TODO: 重新设置errno
 		errno = ENOMEM;
-		return -1;
+		//return -1;
 	}
 	return 0;
 }
@@ -565,17 +569,25 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-	struct client *client, server = {
-		.fd[1] = epoll_fd,
-		.state = SS_4_ESTABLISHED,
-		.pt = 0,	// 记录线程数
-	};
+	sbHolder buffers, clients;
+	sbholder_init(&buffers, sizeof(struct buffer));
+	sbholder_init(&clients, sizeof(struct client));
+	struct client *client, *server;
+	if (!(server = sbholder_alloc(&clients))) {
+		perror("sbholder_alloc");
+		close(epoll_fd);
+		return -2;
+	}
+
+	server->fd[1] = epoll_fd;
+	server->state = SS_4_ESTABLISHED;
+	server->pt = 0;	// 记录线程数
 	struct epoll_event events[MAX_EVENTS], ev = {
 		.events = EPOLLET | EPOLLIN,
-		.data.ptr = (unsigned long)&server | 0UL,
+		.data.ptr = (unsigned long)server | 1UL,
 	};
-	if ((server.fd[0] = server_listen(param_resolve(argc, argv))) < 0
-		|| epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server.fd[0], &ev)) {
+	if ((server->fd[0] = server_listen(param_resolve(argc, argv))) < 0
+		|| epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server->fd[0], &ev)) {
 		perror("server_listen/epoll_add");
 		goto exit;
 	}
@@ -594,9 +606,9 @@ int main(int argc, char *argv[]) {
 					client->state = SS_4_ESTABLISHED;
 					pthread_join(client->pt, 0);
 					// TODO: 从client中获取对应的server，重新触发accept事件
-					--server.pt;
-					//dolog("Threads: %d\n", server.pt);
-					epoll_ctl(server.fd[1], EPOLL_CTL_MOD, server.fd[0], &ev);
+					--server->pt;
+					//dolog("Threads: %d\n", server->pt);
+					epoll_ctl(server->fd[1], EPOLL_CTL_MOD, server->fd[0], &ev);
 					/* fall through */
 				case SS_4_ESTABLISHED:
 					// 出现错误，由读写回调来处理错误
@@ -605,7 +617,7 @@ int main(int argc, char *argv[]) {
 					}
 					if (client->fd[1] == epoll_fd) {
 						// 服务端
-						if (((events[i].events & EPOLLIN) && server_handle(client))) {
+						if (((events[i].events & EPOLLIN) && server_handle(client, &clients))) {
 							// 需要关闭
 							client->state = i;
 							// epoll_fd不用关闭
@@ -614,11 +626,11 @@ int main(int argc, char *argv[]) {
 					} else {
 						// 客户端
 						// 按位或运算
-						if (((events[i].events & EPOLLIN) && client_handle(client, instance))
-							| ((events[i].events & EPOLLOUT) && client_handle(client, !instance))) {
+						if (((events[i].events & EPOLLIN) && client_handle(client, instance, &buffers))
+							| ((events[i].events & EPOLLOUT) && client_handle(client, !instance, &buffers))) {
 							client->state = i;
-							free(client->ptr[1]);
-							free(client->ptr[0]);
+							sbholder_free(&buffers, client->buf[1]);
+							sbholder_free(&buffers, client->buf[0]);
 							close(client->fd[1]);
 							close(client->fd[0]);
 						}
@@ -633,12 +645,12 @@ int main(int argc, char *argv[]) {
 		for (i = 0; i < ret; ++i) {
 			client = (unsigned long)events[i].data.ptr & ~1UL;
 			// 无符号比较，在最后引用时执行清理
-			if (client->state <= i) { free(client); }
+			if (client->state <= i) { sbholder_free(&clients, client); }
 		}
     }
     perror("epoll_pwait");
 exit:
-	close(server.fd[0]);
+	close(server->fd[0]);
 	close(epoll_fd);
 	return 0;
 }
