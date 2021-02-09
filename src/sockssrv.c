@@ -37,9 +37,7 @@
 #include "sbholder.h"
 #include "sblist.h"
 
-#define MAX_RETRIES 0
-#define MAX_THREADS 32
-
+#define MAX_THREADS -1
 #define MAX_EVENTS 128
 #define THREAD_BUFFER_SIZE 1460
 
@@ -103,7 +101,7 @@ union sockaddr_union {
 	struct sockaddr_in6 v6;
 };
 
-#define SOCKADDR_UNION_AF(PTR) (PTR)->v6.sin6_family
+#define SOCKADDR_UNION_AF(PTR) (PTR)->v4.sin_family
 
 #define SOCKADDR_UNION_LENGTH(PTR) (\
 	(SOCKADDR_UNION_AF(PTR) == AF_INET6) ? sizeof((PTR)->v6) : sizeof((PTR)->v4))
@@ -132,6 +130,13 @@ static const char *auth_pass = 0;
 static sblist *auth_ips = 0;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static union sockaddr_union bind_addr = { .v4.sin_family = AF_UNSPEC, };
+// listen解析TCP地址，AI_PASSIVE置位，0返回通配地址
+static struct addrinfo hints = {
+	.ai_flags = AI_ADDRCONFIG | AI_PASSIVE,
+	.ai_family = AF_UNSPEC,
+	.ai_socktype = SOCK_STREAM,
+	.ai_protocol = 0,
+};
 
 #ifndef CONFIG_LOG
 #define CONFIG_LOG 1
@@ -147,10 +152,10 @@ static void dolog(const char *fmt, ...) { }
 
 static int socks5_connect(union sockaddr_union *remote, int ai_socktype) {
 	int ret;
-	if ((ret = socket(SOCKADDR_UNION_AF(remote), ai_socktype, 0)) < 0
+	if ((ret = socket(SOCKADDR_UNION_AF(remote), ai_socktype | SOCK_NONBLOCK, 0)) < 0
 		|| (SOCKADDR_UNION_AF(&bind_addr) != AF_UNSPEC
 		&& bind(ret, (struct sockaddr *)&bind_addr, SOCKADDR_UNION_LENGTH(&bind_addr)))
-		|| connect(ret, (struct sockaddr *)remote, SOCKADDR_UNION_LENGTH(remote))) {
+		|| (connect(ret, (struct sockaddr *)remote, SOCKADDR_UNION_LENGTH(remote)) && errno != EINPROGRESS)) {
 		perror("socket/bind/connect");
 		close(ret);
 		switch(errno) {
@@ -211,26 +216,21 @@ static int socks5_proxy(union sockaddr_union *client, uint8_t *buf, size_t n) {
 
 			uint16_t port = *(uint16_t *)&buf[i];
 			buf[i] = 0;	// 设置host结束符
-			struct addrinfo *p, *addr, hints = {
-				.ai_flags = AI_ADDRCONFIG,
-				.ai_family = SOCKADDR_UNION_AF(&bind_addr),
-				.ai_socktype = SOCK_STREAM,
-				.ai_protocol = 0,
-			};
 		#if CONFIG_LOG
 			dolog("client %s: connected to %s:%d\n", (char *)&buf[4+1+255+2], (char *)&buf[4+1], ntohs(port));
 		#endif
 			/* there's no suitable errorcode in rfc1928 for dns lookup failure */
+			struct addrinfo *p, *addr;
 			ret = getaddrinfo((char *)&buf[4+1], 0, &hints, &addr);
 			*(uint16_t *)&buf[i] = port;	// 恢复原始数据
 			if (ret) {
 				dolog("proxy_resolve: %s\n", gai_strerror(ret));
 				return -EC_GENERAL_FAILURE;
 			}
-			for (i = MAX_RETRIES, p = addr; p; p = p->ai_next) {
+			for (p = addr; p; p = p->ai_next) {
 				//dolog("retry: %d, next: %d\n", i, p->ai_next);
 				*SOCKADDR_UNION_PORT((union sockaddr_union *)p->ai_addr) = port;
-				if ((ret = socks5_connect((union sockaddr_union *)p->ai_addr, p->ai_socktype)) >= 0 || !i--) {
+				if ((ret = socks5_connect((union sockaddr_union *)p->ai_addr, p->ai_socktype)) >= 0) {
 					break;
 				}
 			}
@@ -301,14 +301,14 @@ static enum errorcode check_credentials(uint8_t *buf, size_t n) {
 
 static void send_auth_response(int fd, uint8_t *buf, enum errorcode code) {
 	buf[1] = code;
-	send(fd, buf, 2, 0);
+	send(fd, buf, 2, MSG_WAITALL);
 }
 
 static void send_code(int fd, uint8_t *buf, enum errorcode code) {
 	/* position 4 contains ATYP, the address type, which is the same as used in the connect
 	   request. we're lazy and return always IPV4 address type in errors. */
 	buf[1] = code; buf[3] = AT_IPV4; /*AT_IPV4*/
-	send(fd, buf, 4 + 4 + 2, 0);
+	send(fd, buf, 4 + 4 + 2, MSG_WAITALL);
 }
 
 static void *socks5_handle(void *data) {
@@ -393,7 +393,7 @@ static void usage(void) {
 	dprintf(2,
 		"MicroSocks SOCKS5 Server\n"
 		"------------------------\n"
-		"usage: microsocks  -b bindaddr -i listenip -p port -u user -P password -1\n"
+		"usage: microsocks -b bindaddr -i listenip -p port -u user -P password -1\n"
 		"all arguments are optional.\n"
 		"by default listenip is 0.0.0.0 and port 1080.\n\n"
 		"option -b specifies which ip outgoing connections are bound to\n"
@@ -407,13 +407,6 @@ static void usage(void) {
 }
 
 static struct addrinfo *param_resolve(int argc, char *argv[]) {
-	// 解析TCP地址，AI_PASSIVE置位，0返回通配地址
-	static const struct addrinfo hints = {
-		.ai_flags = AI_ADDRCONFIG | AI_PASSIVE,
-		.ai_family = AF_UNSPEC,
-		.ai_socktype = SOCK_STREAM,
-		.ai_protocol = 0,
-	};
 	struct addrinfo *addr;
 	const char *listen_ip = 0;
 	const char *listen_port = "1080";
@@ -421,12 +414,6 @@ static struct addrinfo *param_resolve(int argc, char *argv[]) {
 	int ret;
 	for (; (ret = getopt(argc, argv, ":b:i:p:u:P:1")) >= 0; ) {
 		switch (ret) {
-			case 'i':
-				listen_ip = optarg;
-				break;
-			case 'p':
-				listen_port = optarg;
-				break;
 			case 'b':
 				if ((ret = getaddrinfo(optarg, 0, &hints, &addr))) {
 					dolog("bind_resolve: %s\n", gai_strerror(ret));
@@ -434,6 +421,12 @@ static struct addrinfo *param_resolve(int argc, char *argv[]) {
 				}
 				memcpy(&bind_addr, addr->ai_addr, addr->ai_addrlen);
 				freeaddrinfo(addr);
+				break;
+			case 'i':
+				listen_ip = optarg;
+				break;
+			case 'p':
+				listen_port = optarg;
 				break;
 			case 'u':
 				auth_user = strdup(optarg);
@@ -463,8 +456,6 @@ static struct addrinfo *param_resolve(int argc, char *argv[]) {
 		dprintf(2, "error: auth-once option must be used together with user/pass\n");
 		return 0;
 	}
-
-	// 解析TCP地址
 	if ((ret = getaddrinfo(listen_ip, listen_port, &hints, &addr))) {
 		dolog("listen_resolve: %s\n", gai_strerror(ret));
 		return 0;
@@ -482,7 +473,7 @@ static int client_handle(struct client *client, uint8_t instance, sbHolder *buff
 		n = buffer->capacity;
 		for (; i < n; i += t) {
 			if ((t = send(client->fd[!instance], &buffer->data[i], n - i, MSG_DONTWAIT)) > 0) {}
-			else if (t < 0 && errno == EAGAIN) {
+			else if (t < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 				buffer->count = i;
 				return 0;
 			} else { return -1; }
@@ -495,7 +486,7 @@ static int client_handle(struct client *client, uint8_t instance, sbHolder *buff
 	for (; (n = recv(client->fd[instance], buf, sizeof(buf), MSG_DONTWAIT)) > 0;) {
 		for (i = 0; i < n; i += t) {
 			if ((t = send(client->fd[!instance], &buf[i], n - i, MSG_DONTWAIT)) > 0) {}
-			else if (t < 0 && errno == EAGAIN) {
+			else if (t < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
 				// 数据未发完
 				if (!(buffer = sbholder_alloc(buffers))) {
 					dolog("client_handle/alloc failed. OOM?\n");
@@ -509,7 +500,7 @@ static int client_handle(struct client *client, uint8_t instance, sbHolder *buff
 			} else { return -1; }
 		}
 	}
-	if (n < 0 && errno == EAGAIN) { return 0; }
+	if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { return 0; }
 	else { return -1; }	// 需要关闭
 }
 
@@ -517,7 +508,7 @@ static int server_handle(struct client *server, sbHolder *clients) {
 	int fd, epoll_fd = server->fd[1];
 	struct client *client;
 	for (; server->pt < MAX_THREADS
-		&& (fd = accept(server->fd[0], 0, 0)) >= 0
+		&& (fd = accept4(server->fd[0], 0, 0, 0)) >= 0
 		&& (client = sbholder_alloc(clients)); ++server->pt) {
 		client->fd[0] = fd;
 		client->fd[1] = epoll_fd;
@@ -550,11 +541,16 @@ static int server_handle(struct client *server, sbHolder *clients) {
 		}
 	}
 	// 可能还有连接，ET模式忽略accept事件
-	if (server->pt < MAX_THREADS && fd >= 0) {
-		dolog("rejecting connection due to OOM?\n");
-		close(fd);
-		// TODO: 重新设置errno
-		errno = ENOMEM;
+	if (server->pt < MAX_THREADS) {
+		if (fd >= 0) {
+			dolog("rejecting connection due to OOM?\n");
+			close(fd);
+			// TODO: 重新设置errno
+			errno = ENOMEM;
+		} else if (errno == EAGAIN || errno == EWOULDBLOCK
+			|| errno == ECONNABORTED || errno == EPROTO) {
+			return 0;
+		}
 		//return -1;
 	}
 	return 0;
@@ -584,7 +580,7 @@ int main(int argc, char *argv[]) {
 	server->pt = 0;	// 记录线程数
 	struct epoll_event events[MAX_EVENTS], ev = {
 		.events = EPOLLET | EPOLLIN,
-		.data.ptr = (unsigned long)server | 1UL,
+		.data.ptr = (unsigned long)server | 0UL,
 	};
 	if ((server->fd[0] = server_listen(param_resolve(argc, argv))) < 0
 		|| epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server->fd[0], &ev)) {
@@ -647,8 +643,8 @@ int main(int argc, char *argv[]) {
 			// 无符号比较，在最后引用时执行清理
 			if (client->state <= i) { sbholder_free(&clients, client); }
 		}
-    }
-    perror("epoll_pwait");
+	}
+	perror("epoll_pwait");
 exit:
 	close(server->fd[0]);
 	close(epoll_fd);

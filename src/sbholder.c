@@ -49,8 +49,8 @@ static void sbholder_sizedown(sbHolder *holder) {
 		uint32_t shift;
 		// 在最大容量之后回收block
 		if ((block = holder->blocks[shift = sbholder_log2(holder->capacity)]) && !(block->count)) {
-			holder->blocks[shift] = 0;
 			free(block);
+			holder->blocks[shift] = 0;
 		}
 		holder->capacity /= 2;
 	}
@@ -63,7 +63,7 @@ void *sbholder_alloc(sbHolder *holder) {
 	uint32_t shift, key;
 	// lock
 	for (shift = 0; holder->capacity & (1 << shift); ++shift) {
-		if ((block = holder->blocks[shift]) && (key = block->next)) {	// 存在该key
+		if ((block = holder->blocks[shift]) && (key = block->next)) {	// key存在
 			sbBlockNode *blocknode = getblocknode(block, holder->itemsize, key - (1 << shift));
 			block->next = blocknode->next;
 			blocknode->next = key;
@@ -82,13 +82,12 @@ void *sbholder_free(sbHolder *holder, void *addr) {
 	sbBlock *block;
 	uint32_t shift, key;
 	// lock
-	if (addr && (key = blocknode->next) && (block = holder->blocks[shift = sbholder_log2(key)])) {	// 存在该key
+	if (addr && (key = blocknode->next) && (block = holder->blocks[shift = sbholder_log2(key)])) {	// key存在
 		--holder->count;
 		if (!(--block->count) && key > holder->capacity) {	// 在最大容量之后才回收block
 			free(block);
 			holder->blocks[shift] = 0;
-		}
-		else {
+		} else {
 			blocknode->next = block->next;
 			block->next = key;
 		}
