@@ -6,15 +6,7 @@ typedef struct {
 	uint32_t next;
 } sbBlockNode;
 
-static const uint8_t log2_table[] = { -1, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, };
-
-static uint8_t sbholder_log2(uint32_t x) {
-	uint8_t y = 0;
-	if (x >= 65536) { x >>= 16; y += 16; }
-	if (x >= 256  ) { x >>= 8 ; y += 8 ; }
-	if (x >= 16   ) { x >>= 4 ; y += 4 ; }
-	return y + log2_table[x];
-}
+#define sbholder_log2(x)	(31 - __builtin_clz(x))
 
 #define getblocknode(block, itemsize, offset)	((sbBlockNode *)((uint8_t *)(block) + sizeof(*(block)) + (itemsize) * (offset)))
 

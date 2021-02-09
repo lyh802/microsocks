@@ -588,6 +588,9 @@ int main(int argc, char *argv[]) {
 		goto exit;
 	}
 
+	// connect时的resolve配置
+	hints.ai_flags = AI_ADDRCONFIG;
+	hints.ai_family = SOCKADDR_UNION_AF(&bind_addr);
 	for (; (ret = epoll_wait(epoll_fd, events, MAX_EVENTS, -1)) > 0;) {
 		size_t i;
 		for (i = 0; i < ret; ++i) {
